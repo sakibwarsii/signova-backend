@@ -127,7 +127,7 @@ Output JSON ONLY with exact keys:
         content = completion.choices[0].message.content.strip()
         data = json.loads(content)
         return {
-            "subtitle_text": data.get("subtitle_text") or raw_text,
+            "subtitle_text": raw_text.strip(),
             "english_text": data.get("english_text") or raw_text,
             "sign_glosses": [g.lower() for g in data.get("sign_glosses", []) if isinstance(g, str)]
         }
@@ -136,9 +136,9 @@ Output JSON ONLY with exact keys:
         try:
             cleaned = await smart_clean_text(raw_text)
             glosses = process_text(cleaned)
-            return {"subtitle_text": raw_text, "english_text": cleaned, "sign_glosses": glosses}
+            return {"subtitle_text": raw_text.strip(), "english_text": cleaned, "sign_glosses": glosses}
         except Exception:
-            return {"subtitle_text": raw_text, "english_text": raw_text, "sign_glosses": [w.lower() for w in raw_text.split()]}
+            return {"subtitle_text": raw_text.strip(), "english_text": raw_text, "sign_glosses": [w.lower() for w in raw_text.split()]}
 
 def process_text(text: str) -> list:
     doc = nlp(text.lower())
