@@ -114,36 +114,42 @@ async def transcribe_audio_groq(pcm_bytes: bytes) -> str:
 
 class ConnectionManager:
     def __init__(self):
-        self.display_connections: list[WebSocket] = []
+        # Maps session_id -> list of display WebSocket connections for complete multi-user isolation
+        from collections import defaultdict
+        self.session_displays: dict[str, list[WebSocket]] = defaultdict(list)
 
-    async def connect_display(self, websocket: WebSocket):
+    async def connect_display(self, websocket: WebSocket, session_id: str = "default"):
         await websocket.accept()
-        self.display_connections.append(websocket)
+        self.session_displays[session_id].append(websocket)
 
-    def disconnect_display(self, websocket: WebSocket):
-        if websocket in self.display_connections:
-            self.display_connections.remove(websocket)
+    def disconnect_display(self, websocket: WebSocket, session_id: str = "default"):
+        if websocket in self.session_displays.get(session_id, []):
+            self.session_displays[session_id].remove(websocket)
+        if session_id in self.session_displays and not self.session_displays[session_id]:
+            self.session_displays.pop(session_id, None)
 
-    async def broadcast(self, message: dict):
-        for connection in list(self.display_connections):
+    async def send_to_session(self, session_id: str, message: dict):
+        """Broadcasts messages strictly to display connections belonging to the sender's session."""
+        displays = list(self.session_displays.get(session_id, []))
+        for connection in displays:
             try:
                 await connection.send_json(message)
             except Exception:
-                self.disconnect_display(connection)
+                self.disconnect_display(connection, session_id)
 
 manager = ConnectionManager()
 
 @app.websocket("/ws/display")
-async def websocket_display(websocket: WebSocket):
-    await manager.connect_display(websocket)
+async def websocket_display(websocket: WebSocket, session_id: str = "default"):
+    await manager.connect_display(websocket, session_id)
     try:
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
-        manager.disconnect_display(websocket)
+        manager.disconnect_display(websocket, session_id)
 
 @app.websocket("/ws/teacher")
-async def websocket_teacher(websocket: WebSocket):
+async def websocket_teacher(websocket: WebSocket, session_id: str = "default"):
     await websocket.accept()
     
     rec = KaldiRecognizer(vosk_model, 16000) if vosk_model else None
@@ -163,30 +169,29 @@ async def websocket_teacher(websocket: WebSocket):
             if message["type"] == "websocket.disconnect":
                 break
 
-            async def handle_final_utterance(text: str, sent_glosses: list, target_lang: str, target_voice: str, tts_on: bool):
+            async def handle_final_utterance(text: str, spoken_lang: str, target_voice: str, tts_on: bool):
                 try:
-                    pipeline_res = await fast_multilingual_pipeline(text, target_lang)
-                    translated_text = pipeline_res.get("subtitle_text") or text
+                    pipeline_res = await fast_multilingual_pipeline(text, spoken_lang)
+                    verbatim_subtitle = pipeline_res.get("subtitle_text") or text
                     cleaned_english = pipeline_res.get("english_text") or text
                     glosses = pipeline_res.get("sign_glosses") or [w.lower() for w in cleaned_english.split()]
 
-                    delta_glosses = glosses[len(sent_glosses):] if len(glosses) > len(sent_glosses) else glosses
                     sigml_sequence = []
-                    for g in delta_glosses:
+                    for g in glosses:
                         sigml_sequence.extend(get_sigml_for_word(g))
 
                     audio_b64 = ""
                     if tts_on:
                         try:
-                            audio_b64 = await generate_tts_base64(translated_text, target_voice)
+                            audio_b64 = await generate_tts_base64(verbatim_subtitle, target_voice)
                         except Exception as e:
                             print(f"[TTS] error: {e}")
 
-                    await manager.broadcast({
+                    await manager.send_to_session(session_id, {
                         "type": "final",
-                        "text": translated_text,
+                        "text": verbatim_subtitle,
                         "original_text": cleaned_english,
-                        "glosses": delta_glosses,
+                        "glosses": glosses,
                         "sigml": sigml_sequence,
                         "audio": audio_b64
                     })
@@ -215,47 +220,20 @@ async def websocket_teacher(websocket: WebSocket):
                         
                         raw_text = whisper_text or vosk_text
                         if raw_text:
-                            current_sent_glosses = list(session_sent_glosses)
-                            session_sent_glosses.clear()
-                            last_processed_word_count = 0
-                            asyncio.create_task(handle_final_utterance(raw_text, current_sent_glosses, current_target_language, current_target_voice, tts_enabled))
+                            asyncio.create_task(handle_final_utterance(raw_text, current_target_language, current_target_voice, tts_enabled))
                         continue
                         
                     if data.get("type") == "text":
                         raw_text = data.get("payload", "")
                         is_final = data.get("isFinal", False)
-                        
-                        words = raw_text.split()
+                        spoken_lang = data.get("language") or current_target_language
                         
                         if not is_final:
-                            # Print raw subtitles instantly
-                            await manager.broadcast({"type": "partial_text_only", "text": raw_text})
-                            
-                            # Delta chunking every 5 words (Fast SpaCy ONLY)
-                            if len(words) - last_processed_word_count >= 5:
-                                glosses = process_text(raw_text)
-                                
-                                delta_glosses = glosses[len(session_sent_glosses):]
-                                if delta_glosses:
-                                    sigml_sequence = []
-                                    for g in delta_glosses:
-                                        sigml_sequence.extend(get_sigml_for_word(g))
-                                    
-                                    await manager.broadcast({
-                                        "type": "partial_sigml",
-                                        "glosses": delta_glosses,
-                                        "sigml": sigml_sequence
-                                    })
-                                    session_sent_glosses.extend(delta_glosses)
-                                last_processed_word_count = len(words)
-                        
+                            # Stream raw partial subtitles instantly for zero-latency visual feedback
+                            await manager.send_to_session(session_id, {"type": "partial_text_only", "text": raw_text})
                         else:
-                            # Final flush - Spawns Async Task to avoid blocking the loop
-                            current_sent_glosses = list(session_sent_glosses)
-                            session_sent_glosses.clear()
-                            last_processed_word_count = 0
-                            
-                            asyncio.create_task(handle_final_utterance(raw_text, current_sent_glosses, current_target_language, current_target_voice, tts_enabled))
+                            # Final utterance: process clean verbatim subtitles in spoken language & ISL signs
+                            asyncio.create_task(handle_final_utterance(raw_text, spoken_lang, current_target_voice, tts_enabled))
                             
                 except json.JSONDecodeError:
                     pass
@@ -277,34 +255,12 @@ async def websocket_teacher(websocket: WebSocket):
                     
                     raw_text = whisper_text or vosk_text
                     if raw_text:
-                        current_sent_glosses = list(session_sent_glosses)
-                        session_sent_glosses.clear()
-                        last_processed_word_count = 0
-                        
-                        asyncio.create_task(handle_final_utterance(raw_text, current_sent_glosses, current_target_language, current_target_voice, tts_enabled))
+                        asyncio.create_task(handle_final_utterance(raw_text, current_target_language, current_target_voice, tts_enabled))
                 elif rec is not None:
                     partial = json.loads(rec.PartialResult())
                     raw_text = partial.get("partial", "")
                     if raw_text:
-                        await manager.broadcast({"type": "partial_text_only", "text": raw_text})
-                        
-                        words = raw_text.split()
-                        if len(words) - last_processed_word_count >= 5:
-                            glosses = process_text(raw_text)
-                            
-                            delta_glosses = glosses[len(session_sent_glosses):]
-                            if delta_glosses:
-                                sigml_sequence = []
-                                for g in delta_glosses:
-                                    sigml_sequence.extend(get_sigml_for_word(g))
-                                
-                                await manager.broadcast({
-                                    "type": "partial_sigml",
-                                    "glosses": delta_glosses,
-                                    "sigml": sigml_sequence
-                                })
-                                session_sent_glosses.extend(delta_glosses)
-                            last_processed_word_count = len(words)
+                        await manager.send_to_session(session_id, {"type": "partial_text_only", "text": raw_text})
 
     except WebSocketDisconnect:
         print("Teacher disconnected")
