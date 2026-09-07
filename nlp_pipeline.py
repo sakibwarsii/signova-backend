@@ -113,12 +113,16 @@ Output JSON ONLY with exact keys:
 """
     try:
         import json
-        completion = await groq_chat_completion(
-            model="qwen/qwen3.8-27b",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=300,
-            response_format={"type": "json_object"}
+        import asyncio
+        completion = await asyncio.wait_for(
+            groq_chat_completion(
+                model="qwen/qwen3.8-27b",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=300,
+                response_format={"type": "json_object"}
+            ),
+            timeout=3.2
         )
         content = completion.choices[0].message.content.strip()
         data = json.loads(content)
