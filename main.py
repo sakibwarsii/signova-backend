@@ -3,7 +3,7 @@ import os
 import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from nlp_pipeline import smart_clean_text, process_text, translate_text_to_language
+from nlp_pipeline import smart_clean_text, process_text, translate_text_to_language, fast_multilingual_pipeline
 from tts_generator import generate_tts_base64
 from vosk import Model, KaldiRecognizer
 from ai_tools import ai_tools_router
@@ -163,6 +163,36 @@ async def websocket_teacher(websocket: WebSocket):
             if message["type"] == "websocket.disconnect":
                 break
 
+            async def handle_final_utterance(text: str, sent_glosses: list, target_lang: str, target_voice: str, tts_on: bool):
+                try:
+                    pipeline_res = await fast_multilingual_pipeline(text, target_lang)
+                    translated_text = pipeline_res.get("subtitle_text") or text
+                    cleaned_english = pipeline_res.get("english_text") or text
+                    glosses = pipeline_res.get("sign_glosses") or [w.lower() for w in cleaned_english.split()]
+
+                    delta_glosses = glosses[len(sent_glosses):] if len(glosses) > len(sent_glosses) else glosses
+                    sigml_sequence = []
+                    for g in delta_glosses:
+                        sigml_sequence.extend(get_sigml_for_word(g))
+
+                    audio_b64 = ""
+                    if tts_on:
+                        try:
+                            audio_b64 = await generate_tts_base64(translated_text, target_voice)
+                        except Exception as e:
+                            print(f"[TTS] error: {e}")
+
+                    await manager.broadcast({
+                        "type": "final",
+                        "text": translated_text,
+                        "original_text": cleaned_english,
+                        "glosses": delta_glosses,
+                        "sigml": sigml_sequence,
+                        "audio": audio_b64
+                    })
+                except Exception as e:
+                    print(f"[handle_final_utterance] error: {e}")
+
             if "text" in message:
                 try:
                     data = json.loads(message["text"])
@@ -188,7 +218,7 @@ async def websocket_teacher(websocket: WebSocket):
                             current_sent_glosses = list(session_sent_glosses)
                             session_sent_glosses.clear()
                             last_processed_word_count = 0
-                            asyncio.create_task(process_final_vosk(raw_text, current_sent_glosses, current_target_language, current_target_voice, tts_enabled))
+                            asyncio.create_task(handle_final_utterance(raw_text, current_sent_glosses, current_target_language, current_target_voice, tts_enabled))
                         continue
                         
                     if data.get("type") == "text":
@@ -225,41 +255,7 @@ async def websocket_teacher(websocket: WebSocket):
                             session_sent_glosses.clear()
                             last_processed_word_count = 0
                             
-                            async def process_final(text, sent_glosses, target_lang, target_voice, tts_on):
-                                # Smart clean with Groq AI: removes stutters, filler words, fixes grammar/homophones,
-                                # and translates regional languages into clean English for accurate sign dictionary matching.
-                                cleaned_english = await smart_clean_text(text)
-                                if not cleaned_english or len(cleaned_english.strip()) == 0:
-                                    cleaned_english = text
-                                
-                                glosses = process_text(cleaned_english)
-                                
-                                delta_glosses = glosses[len(sent_glosses):]
-                                sigml_sequence = []
-                                for g in delta_glosses:
-                                    sigml_sequence.extend(get_sigml_for_word(g))
-                                    
-                                translated_text = cleaned_english
-                                if target_lang != "English":
-                                    if any(ord(c) > 127 for c in text):
-                                        translated_text = text
-                                    else:
-                                        translated_text = await translate_text_to_language(cleaned_english, target_lang)
-
-                                audio_b64 = ""
-                                if tts_on:
-                                    audio_b64 = await generate_tts_base64(translated_text, target_voice)
-                                
-                                await manager.broadcast({
-                                    "type": "final",
-                                    "text": translated_text,
-                                    "original_text": cleaned_english,
-                                    "glosses": delta_glosses,
-                                    "sigml": sigml_sequence,
-                                    "audio": audio_b64
-                                })
-                            
-                            asyncio.create_task(process_final(raw_text, current_sent_glosses, current_target_language, current_target_voice, tts_enabled))
+                            asyncio.create_task(handle_final_utterance(raw_text, current_sent_glosses, current_target_language, current_target_voice, tts_enabled))
                             
                 except json.JSONDecodeError:
                     pass
@@ -285,35 +281,7 @@ async def websocket_teacher(websocket: WebSocket):
                         session_sent_glosses.clear()
                         last_processed_word_count = 0
                         
-                        async def process_final_vosk(text, sent_glosses, target_lang, target_voice, tts_on):
-                            cleaned_english = await smart_clean_text(text)
-                            if not cleaned_english:
-                                cleaned_english = text
-                            glosses = process_text(cleaned_english)
-                            
-                            delta_glosses = glosses[len(sent_glosses):]
-                            sigml_sequence = []
-                            for g in delta_glosses:
-                                sigml_sequence.extend(get_sigml_for_word(g))
-                                
-                            translated_text = cleaned_english
-                            if target_lang != "English":
-                                translated_text = await translate_text_to_language(cleaned_english, target_lang)
-
-                            audio_b64 = ""
-                            if tts_on:
-                                audio_b64 = await generate_tts_base64(translated_text, target_voice)
-                            
-                            await manager.broadcast({
-                                "type": "final",
-                                "text": translated_text,
-                                "original_text": cleaned_english,
-                                "glosses": delta_glosses,
-                                "sigml": sigml_sequence,
-                                "audio": audio_b64
-                            })
-                            
-                        asyncio.create_task(process_final_vosk(raw_text, current_sent_glosses, current_target_language, current_target_voice, tts_enabled))
+                        asyncio.create_task(handle_final_utterance(raw_text, current_sent_glosses, current_target_language, current_target_voice, tts_enabled))
                 elif rec is not None:
                     partial = json.loads(rec.PartialResult())
                     raw_text = partial.get("partial", "")

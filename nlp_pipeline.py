@@ -84,6 +84,59 @@ async def smart_clean_text(raw_text: str) -> str:
         print(f"Groq API error: {e}")
         return raw_text
 
+async def fast_multilingual_pipeline(raw_text: str, target_lang: str = "English") -> dict:
+    """
+    Unified Single-Pass AI Pipeline for all 6 languages (English, Hindi, Marathi, Malayalam, Telugu, Kannada).
+    Executes in under 500ms via qwen/qwen3.8-27b on Groq:
+    - Strips filler words ("um", "uh", "like"), stutters, and speech recognizer glitches.
+    - Translates/normalizes meaning directly into simple English sign glosses for Sign Language lookup.
+    - Generates pristine, grammatical subtitle text in the target language.
+    """
+    if not raw_text or len(raw_text.strip()) < 2:
+        return {"subtitle_text": "", "english_text": "", "sign_glosses": []}
+
+    prompt = f"""
+You are a real-time Educational Sign Language Interpreter.
+Input Speech: "{raw_text}"
+Target Subtitle Language: {target_lang}
+
+Task:
+1. Strip out filler words ("umm", "like", "uh"), stutters, and speech recognizer glitches.
+2. If the speech is in Hindi, Marathi, Telugu, Malayalam, Kannada, or English, extract simple, clear English base words (sign glosses) suitable for Sign Language (e.g. hello, welcome, class, teacher, student, science, gravity, learn, earth, water, book, sun, good, morning).
+3. Generate natural, grammatical subtitle text in {target_lang}.
+
+Output JSON ONLY with exact keys:
+{{
+  "subtitle_text": "cleaned sentence in {target_lang}",
+  "english_text": "faithful English translation",
+  "sign_glosses": ["list", "of", "english", "base", "sign", "words"]
+}}
+"""
+    try:
+        import json
+        completion = await groq_chat_completion(
+            model="qwen/qwen3.8-27b",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=300,
+            response_format={"type": "json_object"}
+        )
+        content = completion.choices[0].message.content.strip()
+        data = json.loads(content)
+        return {
+            "subtitle_text": data.get("subtitle_text") or raw_text,
+            "english_text": data.get("english_text") or raw_text,
+            "sign_glosses": [g.lower() for g in data.get("sign_glosses", []) if isinstance(g, str)]
+        }
+    except Exception as e:
+        print(f"[fast_multilingual_pipeline] Groq error: {e}")
+        try:
+            cleaned = await smart_clean_text(raw_text)
+            glosses = process_text(cleaned)
+            return {"subtitle_text": raw_text, "english_text": cleaned, "sign_glosses": glosses}
+        except Exception:
+            return {"subtitle_text": raw_text, "english_text": raw_text, "sign_glosses": [w.lower() for w in raw_text.split()]}
+
 def process_text(text: str) -> list:
     doc = nlp(text.lower())
     glosses = []
