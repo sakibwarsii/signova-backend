@@ -112,21 +112,50 @@ async def transcribe_audio_groq(pcm_bytes: bytes) -> str:
         print(f"[Groq Whisper] error: {e}")
         return ""
 
+import uuid
+import re
+import time
+
 class ConnectionManager:
     def __init__(self):
         # Maps session_id -> list of display WebSocket connections for complete multi-user isolation
         from collections import defaultdict
         self.session_displays: dict[str, list[WebSocket]] = defaultdict(list)
+        # Cache of recent utterances per session to prevent repeated speech/signs: session_id -> list of (timestamp, norm_text)
+        self.session_history: dict[str, list[tuple[float, str]]] = defaultdict(list)
 
-    async def connect_display(self, websocket: WebSocket, session_id: str = "default"):
+    async def connect_display(self, websocket: WebSocket, session_id: str = ""):
         await websocket.accept()
-        self.session_displays[session_id].append(websocket)
+        sess = session_id.strip() if session_id and session_id.strip() and session_id.strip() != "default" else f"auto_{uuid.uuid4().hex[:10]}"
+        self.session_displays[sess].append(websocket)
+        print(f"[WS Display] Connected to session: {sess} (total displays in session: {len(self.session_displays[sess])})")
+        return sess
 
-    def disconnect_display(self, websocket: WebSocket, session_id: str = "default"):
-        if websocket in self.session_displays.get(session_id, []):
+    def disconnect_display(self, websocket: WebSocket, session_id: str):
+        if session_id in self.session_displays and websocket in self.session_displays[session_id]:
             self.session_displays[session_id].remove(websocket)
         if session_id in self.session_displays and not self.session_displays[session_id]:
             self.session_displays.pop(session_id, None)
+            self.session_history.pop(session_id, None)
+        print(f"[WS Display] Disconnected from session: {session_id}")
+
+    def is_duplicate(self, session_id: str, text: str) -> bool:
+        """Drops repeated utterances within 8 seconds for the same session to prevent duplicate speech/signing."""
+        norm = re.sub(r'[\s.,/#!$%^&*;:{}=\-_`~()\'\"।?]+', '', text.lower().strip())
+        if not norm:
+            return True
+        now = time.time()
+        # Keep utterances from last 8 seconds
+        history = [item for item in self.session_history[session_id] if now - item[0] < 8.0]
+        for t, old_norm in history:
+            if old_norm == norm:
+                return True
+            if len(old_norm) > 3 and len(norm) > 3:
+                if old_norm in norm or norm in old_norm:
+                    return True
+        history.append((now, norm))
+        self.session_history[session_id] = history[-10:]
+        return False
 
     async def send_to_session(self, session_id: str, message: dict):
         """Broadcasts messages strictly to display connections belonging to the sender's session."""
@@ -140,24 +169,24 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 @app.websocket("/ws/display")
-async def websocket_display(websocket: WebSocket, session_id: str = "default"):
-    await manager.connect_display(websocket, session_id)
+async def websocket_display(websocket: WebSocket, session_id: str = ""):
+    active_session = await manager.connect_display(websocket, session_id)
     try:
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
-        manager.disconnect_display(websocket, session_id)
+        manager.disconnect_display(websocket, active_session)
 
 @app.websocket("/ws/teacher")
-async def websocket_teacher(websocket: WebSocket, session_id: str = "default"):
+async def websocket_teacher(websocket: WebSocket, session_id: str = ""):
     await websocket.accept()
+    # Ensure every teacher has a valid session id matching its display socket
+    active_session = session_id.strip() if session_id and session_id.strip() and session_id.strip() != "default" else f"auto_{uuid.uuid4().hex[:10]}"
+    print(f"[WS Teacher] Connected with session: {active_session}")
     
     rec = KaldiRecognizer(vosk_model, 16000) if vosk_model else None
     audio_buffer = bytearray()
     
-    # State for Delta Glossing (0-Lag)
-    session_sent_glosses = []
-    last_processed_word_count = 0
     current_target_language = "English"
     current_target_voice = "hi-IN-MadhurNeural"
     tts_enabled = False
@@ -169,11 +198,20 @@ async def websocket_teacher(websocket: WebSocket, session_id: str = "default"):
             if message["type"] == "websocket.disconnect":
                 break
 
-            async def handle_final_utterance(text: str, spoken_lang: str, target_voice: str, tts_on: bool):
+            async def handle_final_utterance(text: str, spoken_lang: str, target_voice: str, tts_on: bool, target_sess: str):
                 try:
-                    pipeline_res = await fast_multilingual_pipeline(text, spoken_lang)
-                    verbatim_subtitle = pipeline_res.get("subtitle_text") or text
-                    cleaned_english = pipeline_res.get("english_text") or text
+                    clean_raw = text.strip()
+                    if not clean_raw:
+                        return
+                    if manager.is_duplicate(target_sess, clean_raw):
+                        print(f"[Deduplication] Dropped duplicate utterance for {target_sess}: '{clean_raw}'")
+                        return
+
+                    # 100% VERBATIM SUBTITLE - NEVER TRANSLATED!
+                    verbatim_subtitle = clean_raw
+                    
+                    pipeline_res = await fast_multilingual_pipeline(clean_raw, spoken_lang)
+                    cleaned_english = pipeline_res.get("english_text") or clean_raw
                     glosses = pipeline_res.get("sign_glosses") or [w.lower() for w in cleaned_english.split()]
 
                     sigml_sequence = []
@@ -187,7 +225,7 @@ async def websocket_teacher(websocket: WebSocket, session_id: str = "default"):
                         except Exception as e:
                             print(f"[TTS] error: {e}")
 
-                    await manager.send_to_session(session_id, {
+                    await manager.send_to_session(target_sess, {
                         "type": "final",
                         "text": verbatim_subtitle,
                         "original_text": cleaned_english,
@@ -201,6 +239,9 @@ async def websocket_teacher(websocket: WebSocket, session_id: str = "default"):
             if "text" in message:
                 try:
                     data = json.loads(message["text"])
+                    # Check if client passed an explicit session_id in the JSON payload
+                    msg_sess = data.get("session_id") or active_session
+                    
                     if data.get("type") == "config":
                         current_target_language = data.get("targetLanguage", current_target_language)
                         current_target_voice = data.get("targetVoice", current_target_voice)
@@ -220,7 +261,7 @@ async def websocket_teacher(websocket: WebSocket, session_id: str = "default"):
                         
                         raw_text = whisper_text or vosk_text
                         if raw_text:
-                            asyncio.create_task(handle_final_utterance(raw_text, current_target_language, current_target_voice, tts_enabled))
+                            asyncio.create_task(handle_final_utterance(raw_text, current_target_language, current_target_voice, tts_enabled, msg_sess))
                         continue
                         
                     if data.get("type") == "text":
@@ -230,10 +271,10 @@ async def websocket_teacher(websocket: WebSocket, session_id: str = "default"):
                         
                         if not is_final:
                             # Stream raw partial subtitles instantly for zero-latency visual feedback
-                            await manager.send_to_session(session_id, {"type": "partial_text_only", "text": raw_text})
+                            await manager.send_to_session(msg_sess, {"type": "partial_text_only", "text": raw_text})
                         else:
                             # Final utterance: process clean verbatim subtitles in spoken language & ISL signs
-                            asyncio.create_task(handle_final_utterance(raw_text, spoken_lang, current_target_voice, tts_enabled))
+                            asyncio.create_task(handle_final_utterance(raw_text, spoken_lang, current_target_voice, tts_enabled, msg_sess))
                             
                 except json.JSONDecodeError:
                     pass
@@ -245,6 +286,7 @@ async def websocket_teacher(websocket: WebSocket, session_id: str = "default"):
                 if len(audio_buffer) > 480000:
                     audio_buffer = audio_buffer[-480000:]
 
+                # For Indian languages, Groq Whisper transcribes speech when buffer reaches 1.5 seconds or silence
                 if rec is not None and rec.AcceptWaveform(data):
                     vosk_text = json.loads(rec.Result()).get("text", "")
                     
@@ -255,12 +297,12 @@ async def websocket_teacher(websocket: WebSocket, session_id: str = "default"):
                     
                     raw_text = whisper_text or vosk_text
                     if raw_text:
-                        asyncio.create_task(handle_final_utterance(raw_text, current_target_language, current_target_voice, tts_enabled))
+                        asyncio.create_task(handle_final_utterance(raw_text, current_target_language, current_target_voice, tts_enabled, active_session))
                 elif rec is not None:
                     partial = json.loads(rec.PartialResult())
                     raw_text = partial.get("partial", "")
                     if raw_text:
-                        await manager.send_to_session(session_id, {"type": "partial_text_only", "text": raw_text})
+                        await manager.send_to_session(active_session, {"type": "partial_text_only", "text": raw_text})
 
     except WebSocketDisconnect:
         print("Teacher disconnected")
