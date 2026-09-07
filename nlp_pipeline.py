@@ -84,30 +84,29 @@ async def smart_clean_text(raw_text: str) -> str:
         print(f"Groq API error: {e}")
         return raw_text
 
-async def fast_multilingual_pipeline(raw_text: str, target_lang: str = "English") -> dict:
+async def fast_multilingual_pipeline(raw_text: str, spoken_language: str = "English") -> dict:
     """
     Unified Single-Pass AI Pipeline for all 6 languages (English, Hindi, Marathi, Malayalam, Telugu, Kannada).
-    Executes in under 500ms via qwen/qwen3.8-27b on Groq:
-    - Strips filler words ("um", "uh", "like"), stutters, and speech recognizer glitches.
-    - Translates/normalizes meaning directly into simple English sign glosses for Sign Language lookup.
-    - Generates pristine, grammatical subtitle text in the target language.
+    CRITICAL REQUIREMENT: DO NOT translate the spoken subtitle text!
+    - Subtitle text MUST remain in the exact same spoken language and script (cleaned of fillers/stutters).
+    - Sign glosses are extracted as simple English base words for Indian Sign Language animation.
     """
     if not raw_text or len(raw_text.strip()) < 2:
         return {"subtitle_text": "", "english_text": "", "sign_glosses": []}
 
     prompt = f"""
-You are a real-time Educational Sign Language Interpreter.
-Input Speech: "{raw_text}"
-Target Subtitle Language: {target_lang}
+You are an expert Educational Sign Language Interpreter.
+Input Spoken Speech: "{raw_text}"
+Spoken Language: {spoken_language}
 
-Task:
-1. Strip out filler words ("umm", "like", "uh"), stutters, and speech recognizer glitches.
-2. If the speech is in Hindi, Marathi, Telugu, Malayalam, Kannada, or English, extract simple, clear English base words (sign glosses) suitable for Sign Language (e.g. hello, welcome, class, teacher, student, science, gravity, learn, earth, water, book, sun, good, morning).
-3. Generate natural, grammatical subtitle text in {target_lang}.
+CRITICAL RULES:
+1. DO NOT translate the subtitle into another language. If the speech is in {spoken_language} (Hindi, Marathi, Telugu, Malayalam, Kannada, or English), the "subtitle_text" MUST BE in the EXACT SAME spoken language and script. Clean up filler words ("um", "uh", "umm", "like", stutters) and format with appropriate punctuation, but NEVER translate it into English or any other language.
+2. Extract simple, essential English base words ("sign_glosses") for Indian Sign Language gestures (e.g. hello, welcome, student, teacher, learn, science, earth, water, book, good, morning, gravity).
+3. Provide a brief faithful "english_text" translation solely for sign dictionary fallback.
 
 Output JSON ONLY with exact keys:
 {{
-  "subtitle_text": "cleaned sentence in {target_lang}",
+  "subtitle_text": "cleaned sentence strictly in original spoken {spoken_language} without translation",
   "english_text": "faithful English translation",
   "sign_glosses": ["list", "of", "english", "base", "sign", "words"]
 }}
