@@ -84,6 +84,34 @@ def get_sigml_for_word(word: str) -> list[str]:
             sigml_list.append(fingerspell_dict[char])
     return sigml_list
 
+async def transcribe_audio_groq(pcm_bytes: bytes) -> str:
+    """Ultra-high accuracy multilingual speech transcription via Groq Whisper large-v3-turbo."""
+    if not pcm_bytes or len(pcm_bytes) < 3200:
+        return ""
+    try:
+        from groq_client import _primary_client, _fallback_client
+        client = _primary_client or _fallback_client
+        if not client:
+            return ""
+        import io, wave
+        buf = io.BytesIO()
+        with wave.open(buf, 'wb') as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            wav.writeframes(pcm_bytes)
+        buf.seek(0)
+        buf.name = 'speech.wav'
+        res = await client.audio.transcriptions.create(
+            file=buf,
+            model='whisper-large-v3-turbo',
+            response_format='json'
+        )
+        return res.text.strip() if hasattr(res, 'text') else ""
+    except Exception as e:
+        print(f"[Groq Whisper] error: {e}")
+        return ""
+
 class ConnectionManager:
     def __init__(self):
         self.display_connections: list[WebSocket] = []
@@ -119,6 +147,7 @@ async def websocket_teacher(websocket: WebSocket):
     await websocket.accept()
     
     rec = KaldiRecognizer(vosk_model, 16000) if vosk_model else None
+    audio_buffer = bytearray()
     
     # State for Delta Glossing (0-Lag)
     session_sent_glosses = []
@@ -132,10 +161,6 @@ async def websocket_teacher(websocket: WebSocket):
             message = await websocket.receive()
 
             if message["type"] == "websocket.disconnect":
-                # Raw receive() returns this as data instead of raising — unlike
-                # receive_text()/receive_json(). Without this check the loop would
-                # call receive() again on a disconnected socket, which raises
-                # RuntimeError and spams the log with ASGI exception tracebacks.
                 break
 
             if "text" in message:
@@ -148,14 +173,22 @@ async def websocket_teacher(websocket: WebSocket):
                         continue
 
                     if data.get("type") in ("flush", "stop"):
+                        vosk_text = ""
                         if rec is not None:
                             result = json.loads(rec.FinalResult())
-                            raw_text = result.get("text", "")
-                            if raw_text:
-                                current_sent_glosses = list(session_sent_glosses)
-                                session_sent_glosses.clear()
-                                last_processed_word_count = 0
-                                asyncio.create_task(process_final_vosk(raw_text, current_sent_glosses, current_target_language, current_target_voice, tts_enabled))
+                            vosk_text = result.get("text", "")
+                        
+                        whisper_text = ""
+                        if len(audio_buffer) >= 3200:
+                            whisper_text = await transcribe_audio_groq(bytes(audio_buffer))
+                            audio_buffer.clear()
+                        
+                        raw_text = whisper_text or vosk_text
+                        if raw_text:
+                            current_sent_glosses = list(session_sent_glosses)
+                            session_sent_glosses.clear()
+                            last_processed_word_count = 0
+                            asyncio.create_task(process_final_vosk(raw_text, current_sent_glosses, current_target_language, current_target_voice, tts_enabled))
                         continue
                         
                     if data.get("type") == "text":
@@ -193,8 +226,12 @@ async def websocket_teacher(websocket: WebSocket):
                             last_processed_word_count = 0
                             
                             async def process_final(text, sent_glosses, target_lang, target_voice, tts_on):
-                                # Skip LLM cleaning for browser STT to maximize processing speed
-                                cleaned_english = text 
+                                # Smart clean with Groq AI: removes stutters, filler words, fixes grammar/homophones,
+                                # and translates regional languages into clean English for accurate sign dictionary matching.
+                                cleaned_english = await smart_clean_text(text)
+                                if not cleaned_english or len(cleaned_english.strip()) == 0:
+                                    cleaned_english = text
+                                
                                 glosses = process_text(cleaned_english)
                                 
                                 delta_glosses = glosses[len(sent_glosses):]
@@ -204,16 +241,11 @@ async def websocket_teacher(websocket: WebSocket):
                                     
                                 translated_text = cleaned_english
                                 if target_lang != "English":
-                                    translated_text = await translate_text_to_language(cleaned_english, target_lang)
+                                    if any(ord(c) > 127 for c in text):
+                                        translated_text = text
+                                    else:
+                                        translated_text = await translate_text_to_language(cleaned_english, target_lang)
 
-                                # All languages route through edge-tts now — the
-                                # old Piper/ONNX path for non-English silently
-                                # produced no audio at all in production, since
-                                # its model files were never actually deployed
-                                # (see warm_up_services' docstring above).
-                                # edge-tts has real neural voices for every
-                                # language this app supports, so there's no
-                                # quality tradeoff, just one less moving part.
                                 audio_b64 = ""
                                 if tts_on:
                                     audio_b64 = await generate_tts_base64(translated_text, target_voice)
@@ -232,25 +264,31 @@ async def websocket_teacher(websocket: WebSocket):
                 except json.JSONDecodeError:
                     pass
                         
-            # 2. VOSK LOCAL MODE (Receives RAW Binary Audio)
+            # 2. AUDIO STREAMING MODE (Vosk + Groq Whisper Hybrid)
             elif "bytes" in message:
-                if rec is None:
-                    continue
-                    
                 data = message["bytes"]
-                
-                # Vosk evaluates the chunk instantly
-                if rec.AcceptWaveform(data):
-                    result = json.loads(rec.Result())
-                    raw_text = result.get("text", "")
+                audio_buffer.extend(data)
+                if len(audio_buffer) > 480000:
+                    audio_buffer = audio_buffer[-480000:]
+
+                if rec is not None and rec.AcceptWaveform(data):
+                    vosk_text = json.loads(rec.Result()).get("text", "")
+                    
+                    whisper_text = ""
+                    if len(audio_buffer) >= 3200:
+                        whisper_text = await transcribe_audio_groq(bytes(audio_buffer))
+                        audio_buffer.clear()
+                    
+                    raw_text = whisper_text or vosk_text
                     if raw_text:
-                        # Final flush - Spawns Async Task to avoid blocking the audio stream
                         current_sent_glosses = list(session_sent_glosses)
                         session_sent_glosses.clear()
                         last_processed_word_count = 0
                         
                         async def process_final_vosk(text, sent_glosses, target_lang, target_voice, tts_on):
                             cleaned_english = await smart_clean_text(text)
+                            if not cleaned_english:
+                                cleaned_english = text
                             glosses = process_text(cleaned_english)
                             
                             delta_glosses = glosses[len(sent_glosses):]
@@ -262,8 +300,6 @@ async def websocket_teacher(websocket: WebSocket):
                             if target_lang != "English":
                                 translated_text = await translate_text_to_language(cleaned_english, target_lang)
 
-                            # Same fix as process_final above — every language
-                            # routes through edge-tts now.
                             audio_b64 = ""
                             if tts_on:
                                 audio_b64 = await generate_tts_base64(translated_text, target_voice)
@@ -278,7 +314,7 @@ async def websocket_teacher(websocket: WebSocket):
                             })
                             
                         asyncio.create_task(process_final_vosk(raw_text, current_sent_glosses, current_target_language, current_target_voice, tts_enabled))
-                else:
+                elif rec is not None:
                     partial = json.loads(rec.PartialResult())
                     raw_text = partial.get("partial", "")
                     if raw_text:
@@ -286,7 +322,6 @@ async def websocket_teacher(websocket: WebSocket):
                         
                         words = raw_text.split()
                         if len(words) - last_processed_word_count >= 5:
-                            # Bypass LLM for partials, use fast SpaCy directly
                             glosses = process_text(raw_text)
                             
                             delta_glosses = glosses[len(session_sent_glosses):]
