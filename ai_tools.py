@@ -40,6 +40,15 @@ def get_mini_chunks(text: str, max_words=5):
     words = text.split()
     return [' '.join(words[i:i + max_words]) for i in range(0, len(words), max_words)]
 
+DEFAULT_VOICES = {
+    "English": "en-US-AriaNeural",
+    "Hindi": "hi-IN-SwaraNeural",
+    "Marathi": "mr-IN-AarohiNeural",
+    "Malayalam": "ml-IN-SobhanaNeural",
+    "Telugu": "te-IN-ShrutiNeural",
+    "Kannada": "kn-IN-SapnaNeural",
+}
+
 async def generate_audio_for_chunks(chunks: list, lang: str, voice: str, tts: bool,
                                      progress_callback=None, concurrency: int = 4) -> list:
     """
@@ -52,6 +61,11 @@ async def generate_audio_for_chunks(chunks: list, lang: str, voice: str, tts: bo
         for c in chunks:
             c["audio_base64"] = ""
         return chunks
+
+    # Validate voice against language
+    effective_voice = voice
+    if not effective_voice or (lang == "English" and not effective_voice.startswith("en-")):
+        effective_voice = DEFAULT_VOICES.get(lang, "en-US-AriaNeural")
 
     sem = asyncio.Semaphore(concurrency)
     total = len(chunks)
@@ -66,16 +80,18 @@ async def generate_audio_for_chunks(chunks: list, lang: str, voice: str, tts: bo
                     translated_text = await translate_text_to_language(chunk["text"], lang)
                     chunk["translated_text"] = translated_text
                     text_for_audio = translated_text
-                # All languages route through edge-tts — the old Piper/ONNX
-                # path for non-English silently produced no audio at all in
-                # production, since its model files were never actually
-                # deployed (gitignored, ~496MB, no download step on Railway).
-                # edge-tts has real neural voices for every language this
-                # app supports, so there's no quality tradeoff.
-                chunk["audio_base64"] = await generate_tts_base64(text_for_audio, voice)
+                # All languages route through edge-tts — real neural voices for every language
+                audio_res = await generate_tts_base64(text_for_audio, effective_voice)
+                if not audio_res and effective_voice != DEFAULT_VOICES.get(lang, "en-US-AriaNeural"):
+                    audio_res = await generate_tts_base64(text_for_audio, DEFAULT_VOICES.get(lang, "en-US-AriaNeural"))
+                chunk["audio_base64"] = audio_res or ""
             except Exception as e:
                 print(f"[AudioGen] Error for chunk '{str(chunk.get('text',''))[:30]}': {e}")
-                chunk["audio_base64"] = ""
+                try:
+                    fallback_voice = DEFAULT_VOICES.get(lang, "en-US-AriaNeural")
+                    chunk["audio_base64"] = await generate_tts_base64(text_for_audio, fallback_voice)
+                except Exception:
+                    chunk["audio_base64"] = ""
             finally:
                 completed += 1
                 if progress_callback:
