@@ -2,7 +2,7 @@ import json
 import os
 import re
 import asyncio
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from nlp_pipeline import smart_clean_text, process_text, translate_text_to_language, fast_multilingual_pipeline
 from tts_generator import generate_tts_base64
@@ -304,9 +304,79 @@ async def websocket_teacher(websocket: WebSocket, session_id: str = ""):
                     raw_text = partial.get("partial", "")
                     if raw_text:
                         await manager.send_to_session(active_session, {"type": "partial_text_only", "text": raw_text})
+                elif rec is None:
+                    # Cloud/Render streaming: Groq Whisper transcribes when buffer reaches ~1.5s of audio (48000 bytes)
+                    if len(audio_buffer) >= 48000:
+                        buf_to_transcribe = bytes(audio_buffer)
+                        audio_buffer.clear()
+                        whisper_text = await transcribe_audio_groq(buf_to_transcribe)
+                        if whisper_text and whisper_text.strip():
+                            asyncio.create_task(handle_final_utterance(whisper_text.strip(), current_target_language, current_target_voice, tts_enabled, active_session))
 
     except WebSocketDisconnect:
         print("Teacher disconnected")
+
+@app.post("/api/transcribe-audio")
+async def transcribe_audio_endpoint(file: UploadFile = File(...), lang: str = "English", session_id: str = "default"):
+    """
+    Direct endpoint for casting / video audio to sign conversion:
+    Transcribes the uploaded audio segment using Groq Whisper, converts the text into
+    Indian Sign Language (ISL) glosses and SiGML animation sequence, broadcasts the
+    signs to the active classroom session display, and returns the response directly.
+    """
+    try:
+        audio_content = await file.read()
+        if not audio_content or len(audio_content) < 1000:
+            return {"text": "", "sigml": []}
+
+        from groq_client import _primary_client, _fallback_client
+        client = _primary_client or _fallback_client
+        if not client:
+            return {"error": "Groq client not available", "text": "", "sigml": []}
+
+        import io
+        buf = io.BytesIO(audio_content)
+        buf.name = file.filename or "audio.webm"
+
+        res = await client.audio.transcriptions.create(
+            file=buf,
+            model="whisper-large-v3-turbo",
+            response_format="json"
+        )
+        raw_text = res.text.strip() if hasattr(res, "text") else ""
+        if not raw_text:
+            return {"text": "", "sigml": []}
+
+        # Deduplicate to prevent double-processing identical audio slices
+        target_sess = session_id.strip() if session_id and session_id.strip() else "default"
+        if manager.is_duplicate(target_sess, raw_text):
+            return {"text": raw_text, "sigml": [], "duplicate": True}
+
+        # Convert text into sign glosses via fast multilingual pipeline
+        pipeline_res = await fast_multilingual_pipeline(raw_text, lang)
+        cleaned_english = pipeline_res.get("english_text") or raw_text
+        glosses = pipeline_res.get("sign_glosses") or [w.lower() for w in cleaned_english.split()]
+
+        sigml_sequence = []
+        for g in glosses:
+            sigml_sequence.extend(get_sigml_for_word(g))
+
+        payload = {
+            "type": "final",
+            "text": raw_text,
+            "original_text": cleaned_english,
+            "glosses": glosses,
+            "sigml": sigml_sequence,
+            "source": "cast_video"
+        }
+
+        # Broadcast directly to session displays so classroom avatar signs in real time
+        await manager.send_to_session(target_sess, payload)
+
+        return payload
+    except Exception as e:
+        print(f"[transcribe-audio] error: {e}")
+        return {"error": str(e), "text": "", "sigml": []}
 
 if __name__ == "__main__":
     import uvicorn
