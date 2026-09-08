@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -76,10 +77,13 @@ def load_dicts():
 load_dicts()
 
 def get_sigml_for_word(word: str) -> list[str]:
-    if word in sign_dict:
-        return [sign_dict[word]]
+    clean_w = re.sub(r'[^a-zA-Z0-9]', '', word).lower().strip()
+    if not clean_w:
+        return []
+    if clean_w in sign_dict:
+        return [sign_dict[clean_w]]
     sigml_list = []
-    for char in word:
+    for char in clean_w:
         if char in fingerspell_dict:
             sigml_list.append(fingerspell_dict[char])
     return sigml_list
