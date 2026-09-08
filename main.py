@@ -145,14 +145,11 @@ class ConnectionManager:
         if not norm:
             return True
         now = time.time()
-        # Keep utterances from last 8 seconds
-        history = [item for item in self.session_history[session_id] if now - item[0] < 8.0]
+        # Keep utterances from last 3.5 seconds to prevent accidental double-delivery
+        history = [item for item in self.session_history[session_id] if now - item[0] < 3.5]
         for t, old_norm in history:
             if old_norm == norm:
                 return True
-            if len(old_norm) > 3 and len(norm) > 3:
-                if old_norm in norm or norm in old_norm:
-                    return True
         history.append((now, norm))
         self.session_history[session_id] = history[-10:]
         return False
