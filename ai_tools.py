@@ -358,3 +358,123 @@ async def test_pixazo_endpoint(req: BatchTextRequest):
             }
     except Exception as e:
         return {"error": str(e)}
+
+class HandwritingAnalysisRequest(BaseModel):
+    strokes: list = []
+    raw_text: str = ""
+    lang: str = "English"
+    voice: str = "en-US-AriaNeural"
+    tts: bool = True
+    width: int = 800
+    height: int = 600
+
+@ai_tools_router.post("/api/analyze-handwriting")
+async def analyze_handwriting_endpoint(req: HandwritingAnalysisRequest):
+    import httpx
+    from groq_client import groq_chat_completion
+
+    raw_text = req.raw_text.strip()
+
+    # 1. Stroke-level handwriting recognition via Google Input Tools API
+    if req.strokes and len(req.strokes) > 0:
+        try:
+            google_url = "https://www.google.com/inputtools/request?ime=handwriting&app=mobilesearch&cs=1&oe=UTF-8"
+            payload = {
+                "input_type": "0",
+                "requests": [{
+                    "writing_guide": {
+                        "writing_area_width": max(req.width, 400),
+                        "writing_area_height": max(req.height, 400)
+                    },
+                    "ink": req.strokes,
+                    "language": "en"
+                }]
+            }
+            async with httpx.AsyncClient() as client:
+                res = await client.post(google_url, json=payload, timeout=6.0)
+                if res.status_code == 200:
+                    data = res.json()
+                    if data and len(data) > 1 and data[0] == "SUCCESS":
+                        candidates = data[1][0][1]
+                        if candidates and len(candidates) > 0:
+                            recognized = candidates[0].strip()
+                            if recognized:
+                                raw_text = f"{raw_text} {recognized}".strip() if raw_text else recognized
+        except Exception as e:
+            print(f"[Handwriting] Stroke recognition error: {e}")
+
+    if not raw_text:
+        return {"success": False, "error": "No handwriting or notes detected on board"}
+
+    # 2. Educational Shorthand & Rough Concept Interpreter via Groq LLM
+    concept = raw_text
+    spoken_explanation = raw_text
+
+    try:
+        prompt = f"""You are an expert Educational AI in an Indian classroom. A teacher wrote rough notes, equations, or shorthand on a chalkboard/whiteboard:
+"{raw_text}"
+
+Task:
+Interpret this rough handwriting or shorthand notes into a clear, concise educational explanation (1 sentence, max 15 words) suitable for Indian Sign Language (ISL) interpretation for deaf students.
+Expand math/physics formulas (e.g. F=ma -> Force equals mass times acceleration, v=d/t -> Velocity equals distance divided by time) and educational shorthand into spoken natural language.
+
+Respond ONLY with a valid JSON:
+{{"concept": "...", "spoken_explanation": "..."}}"""
+
+        resp = await groq_chat_completion(
+            model="qwen/qwen3.8-27b",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=150
+        )
+        content = resp.choices[0].message.content.strip()
+        start = content.find('{')
+        end = content.rfind('}') + 1
+        if start != -1 and end != 0:
+            parsed = json.loads(content[start:end])
+            concept = parsed.get("concept", raw_text)
+            spoken_explanation = parsed.get("spoken_explanation", raw_text)
+    except Exception as e:
+        print(f"[Handwriting] Educational interpretation error: {e}")
+
+    # 3. Generate Indian Sign Language (ISL) Glosses and SiGML
+    glosses = process_text(spoken_explanation)
+    sigml_sequence = []
+    for g in glosses:
+        sigml_sequence.extend(get_sigml_for_word_ai(g))
+
+    # 4. Translation and TTS Audio
+    translated_text = ""
+    target_lang = req.lang or "English"
+    if target_lang != "English":
+        try:
+            translated_text = await translate_text_to_language(spoken_explanation, target_lang)
+        except Exception as e:
+            print(f"[Handwriting] Translation error: {e}")
+
+    audio_text = translated_text if translated_text else spoken_explanation
+    audio_base64 = ""
+    if req.tts and audio_text:
+        effective_voice = req.voice or DEFAULT_VOICES.get(target_lang, "en-US-AriaNeural")
+        try:
+            audio_base64 = await generate_tts_base64(audio_text, effective_voice)
+        except Exception as e:
+            print(f"[Handwriting] TTS error: {e}")
+
+    chunk = {
+        "text": spoken_explanation,
+        "translated_text": translated_text,
+        "sigml": sigml_sequence,
+        "audio_base64": audio_base64,
+        "concept": concept
+    }
+
+    return {
+        "success": True,
+        "raw_text": raw_text,
+        "concept": concept,
+        "spoken_explanation": spoken_explanation,
+        "translated_text": translated_text,
+        "chunks": [chunk]
+    }
+
