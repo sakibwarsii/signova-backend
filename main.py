@@ -109,7 +109,8 @@ async def transcribe_audio_groq(pcm_bytes: bytes) -> str:
         res = await client.audio.transcriptions.create(
             file=buf,
             model='whisper-large-v3-turbo',
-            response_format='json'
+            response_format='json',
+            prompt="Indian English classroom teacher speaking with Indian accent. Common words: working, work, walking, science, physics, mathematics, students, computer, education."
         )
         return res.text.strip() if hasattr(res, 'text') else ""
     except Exception as e:
@@ -341,7 +342,8 @@ async def transcribe_audio_endpoint(file: UploadFile = File(...), lang: str = "E
         res = await client.audio.transcriptions.create(
             file=buf,
             model="whisper-large-v3-turbo",
-            response_format="json"
+            response_format="json",
+            prompt="Indian English speech with Indian accent. Common words: working, work, walking, science, physics, mathematics, students, education."
         )
         raw_text = res.text.strip() if hasattr(res, "text") else ""
         if not raw_text:

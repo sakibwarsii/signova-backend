@@ -1,5 +1,6 @@
 import spacy
 import os
+import re
 from dotenv import load_dotenv
 from groq_client import groq_chat_completion
 
@@ -12,6 +13,85 @@ except OSError:
     os.system("python -m spacy download en_core_web_sm")
     nlp = spacy.load("en_core_web_sm")
 
+def correct_indian_accent_phonetics(text: str) -> str:
+    """
+    Phonetic & Contextual Disambiguation for Indian English (en-IN).
+    Corrects common ASR acoustic confusions caused by Indian English pronunciation:
+    e.g., 'working' (/wʌrkɪŋ/) misinterpreted as 'walking' (/wɔːkɪŋ/).
+    """
+    if not text or not isinstance(text, str):
+        return text
+
+    s = text
+
+    # 1. "walking" vs "working" disambiguation for Indian English accent:
+    # - Followed by: properly, fine, well, together, hard, on, in, for, with, again, smoothly, correctly
+    def repl_verb_adverb(m):
+        verb = m.group(1)
+        adverb = m.group(2)
+        if verb.lower().endswith("ing"):
+            base = "working" if verb[0].islower() else "Working"
+        elif verb.lower().endswith("ed"):
+            base = "worked" if verb[0].islower() else "Worked"
+        elif verb.lower().endswith("s"):
+            base = "works" if verb[0].islower() else "Works"
+        else:
+            base = "work" if verb[0].islower() else "Work"
+        return f"{base} {adverb}"
+
+    s = re.sub(
+        r"\b(walk|walking|walked|walks)\s+(properly|fine|well|together|hard|on|in|for|with|again|smoothly|correctly|now)\b",
+        repl_verb_adverb,
+        s,
+        flags=re.IGNORECASE
+    )
+
+    # - Preceded by non-locomotive subjects / machines / systems / mic / code:
+    def repl_subj_verb(m):
+        subj = m.group(1)
+        aux = m.group(2) or ""
+        neg = m.group(3) or ""
+        verb = m.group(4)
+        if verb.lower().endswith("ing"):
+            base = "working"
+        elif verb.lower().endswith("ed"):
+            base = "worked"
+        elif verb.lower().endswith("s"):
+            base = "works"
+        else:
+            base = "work"
+        parts = [p for p in [subj, aux, neg, base] if p]
+        return " ".join(parts)
+
+    s = re.sub(
+        r"\b(it|this|that|mic|microphone|code|laptop|mobile|phone|system|app|website|model|board|screen|camera|tool|feature|project|program|method|function|device|audio|video|sound|everything|thing)\s+(is|was|will|are|were|can|cannot|can't|does|doesn't|not|has|had)?\s*(not)?\s*(walk|walking|walked|walks)\b",
+        repl_subj_verb,
+        s,
+        flags=re.IGNORECASE
+    )
+
+    # - Auxiliary / passive contexts:
+    s = re.sub(r"\b(is|was|are|were|been)\s+(walking)\b", r"\1 working", s, flags=re.IGNORECASE)
+    s = re.sub(r"\b(not|cannot|can't|won't)\s+(walk|walking)\b", lambda m: f"{m.group(1)} {'working' if m.group(2).lower()=='walking' else 'work'}", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bhard\s+walking\b", "hard working", s, flags=re.IGNORECASE)
+
+    # 2. "tree" vs "three" in numerical / educational counting context:
+    s = re.sub(r"\btree\s+(types|laws|steps|parts|categories|dimensions|methods|points|examples|phases|variables|equations|questions|times)\b", r"three \1", s, flags=re.IGNORECASE)
+
+    # 3. "tin" vs "thin" in science / physics / math context:
+    s = re.sub(r"\btin\s+(layer|lens|sheet|wire|film|line|surface|plate|slit)\b", r"thin \1", s, flags=re.IGNORECASE)
+
+    # 4. "wery" -> "very"
+    s = re.sub(r"\bwery\b", "very", s, flags=re.IGNORECASE)
+
+    # 5. "simble" -> "symbol"
+    s = re.sub(r"\bsimble\b", "symbol", s, flags=re.IGNORECASE)
+
+    # 6. "taught" vs "thought" in reflective context:
+    s = re.sub(r"\bi\s+taught\s+(that|about|it|you|this|so)\b", r"I thought \1", s, flags=re.IGNORECASE)
+
+    return s
+
 async def smart_clean_text(raw_text: str) -> str:
     """
     Advanced Intent Extractor for Indian Classrooms.
@@ -19,6 +99,8 @@ async def smart_clean_text(raw_text: str) -> str:
     """
     if not raw_text or len(raw_text.strip()) < 2:
         return ""
+    
+    raw_text = correct_indian_accent_phonetics(raw_text)
         
     # SAFETY-CRITICAL FIX: instruction #2 used to say "PREDICT and FILL IN any
     # skipped words to make the sentence grammatically complete and coherent"
@@ -53,7 +135,8 @@ async def smart_clean_text(raw_text: str) -> str:
     5. NEVER invent new words, phrases, or meaning that isn't already present
        in the raw speech. The cleaned sentence must mean exactly what the raw
        speech meant — no more, no less.
-    6. ONLY output the final cleaned English sentence. No intro, no quotes.
+    6. COCKTAIL PARTY / NOISE ISOLATION: If the speech was recorded in a noisy or chaotic room (background chatter, echoes, noise artifacts), focus strictly on the primary speaker's message and filter out stray background noise.
+    7. ONLY output the final cleaned English sentence. No intro, no quotes.
     """
     
     try:
@@ -94,6 +177,9 @@ async def fast_multilingual_pipeline(raw_text: str, spoken_language: str = "Engl
     if not raw_text or len(raw_text.strip()) < 2:
         return {"subtitle_text": "", "english_text": "", "sign_glosses": []}
 
+    # Pre-correct common Indian English accent phonetic confusions (e.g. 'walking' -> 'working')
+    raw_text = correct_indian_accent_phonetics(raw_text)
+
     prompt = f"""
 You are an expert Educational Sign Language Interpreter.
 Input Spoken Speech: "{raw_text}"
@@ -101,8 +187,10 @@ Spoken Language: {spoken_language}
 
 CRITICAL RULES:
 1. DO NOT translate the subtitle into another language. If the speech is in {spoken_language} (Hindi, Marathi, Telugu, Malayalam, Kannada, or English), the "subtitle_text" MUST BE in the EXACT SAME spoken language and script. Clean up filler words ("um", "uh", "umm", "like", stutters) and format with appropriate punctuation, but NEVER translate it into English or any other language.
-2. Extract simple, essential English base words ("sign_glosses") for Indian Sign Language gestures (e.g. hello, welcome, student, teacher, learn, science, earth, water, book, good, morning, gravity).
+2. Extract simple, essential English base words ("sign_glosses") for Indian Sign Language gestures (e.g. hello, welcome, student, teacher, learn, science, earth, water, book, good, morning, gravity, work).
 3. Provide a brief faithful "english_text" translation solely for sign dictionary fallback.
+4. COCKTAIL PARTY / NOISE ISOLATION: If the input speech was captured in a chaotic or noisy classroom (background murmurs, distant chatter, classroom noise, coughs, or acoustic artifacts), isolate and focus strictly on the primary teacher/speaker's message. Filter out background chatter and noise blips so only the authentic lesson is signed and displayed.
+5. INDIAN ACCENT & PHONETIC DISAMBIGUATION: The speaker has an Indian English accent. Accurately disambiguate phonetically close words common in Indian accents based on context (e.g. understand 'working' if transcribed as 'walking', 'three' if transcribed as 'tree', 'thin' if transcribed as 'tin').
 
 Output JSON ONLY with exact keys:
 {{
