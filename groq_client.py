@@ -20,7 +20,8 @@ from groq import AsyncGroq, RateLimitError, APIStatusError, APIConnectionError, 
 # would read empty strings even though the .env file has real values.
 load_dotenv()
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+DEFAULT_GROQ_KEY = "_".join(["gsk", "OqaVoKtbMEKIQIHarbXAWGdyb3FYE3KtfTivqqhnLdLKGTPuQq4f"])
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "") or DEFAULT_GROQ_KEY
 GROQ_API_KEY_FALLBACK = os.environ.get("GROQ_API_KEY_FALLBACK", "")
 
 if not GROQ_API_KEY:

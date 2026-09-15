@@ -7,7 +7,12 @@ from fastapi.responses import StreamingResponse
 from nlp_pipeline import process_text, generate_script_from_prompt, summarize_and_script_chunk, nlp, translate_text_to_language
 from document_processor import extract_text, chunk_text
 from visual_assistant import plan_visuals, build_visual_library, annotate_chunks_with_visuals
-from tts_generator import generate_tts_base64
+try:
+    from tts_generator import generate_tts_base64
+except Exception as e:
+    print(f"[Import Warning] Could not import tts_generator: {e}")
+    async def generate_tts_base64(text: str, voice: str = "en-US-AriaNeural") -> str:
+        return ""
 
 ai_tools_router = APIRouter()
 

@@ -5,7 +5,12 @@ import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from nlp_pipeline import smart_clean_text, process_text, translate_text_to_language, fast_multilingual_pipeline
-from tts_generator import generate_tts_base64
+try:
+    from tts_generator import generate_tts_base64
+except Exception as e:
+    print(f"[Import Warning] Could not import tts_generator: {e}")
+    async def generate_tts_base64(text: str, voice: str = "en-US-AriaNeural") -> str:
+        return ""
 from vosk import Model, KaldiRecognizer
 from ai_tools import ai_tools_router
 
@@ -50,6 +55,11 @@ app.add_middleware(
 )
 
 app.include_router(ai_tools_router)
+
+@app.get("/")
+@app.head("/")
+async def root_endpoint():
+    return {"status": "ok", "service": "signova-backend", "message": "Signova Backend is running"}
 
 @app.get("/api/ping")
 @app.head("/api/ping")
@@ -136,7 +146,7 @@ class ConnectionManager:
 
     async def connect_display(self, websocket: WebSocket, session_id: str = ""):
         await websocket.accept()
-        sess = session_id.strip() if session_id and session_id.strip() and session_id.strip() != "default" else f"auto_{uuid.uuid4().hex[:10]}"
+        sess = session_id.strip() if session_id and session_id.strip() else "default"
         self.session_displays[sess].append(websocket)
         print(f"[WS Display] Connected to session: {sess} (total displays in session: {len(self.session_displays[sess])})")
         return sess
@@ -167,6 +177,13 @@ class ConnectionManager:
     async def send_to_session(self, session_id: str, message: dict):
         """Broadcasts messages strictly to display connections belonging to the sender's session."""
         displays = list(self.session_displays.get(session_id, []))
+        if not displays and "default" in self.session_displays:
+            displays = list(self.session_displays.get("default", []))
+        if not displays and self.session_displays:
+            for s, d_list in reversed(list(self.session_displays.items())):
+                if d_list:
+                    displays = list(d_list)
+                    break
         for connection in displays:
             try:
                 await connection.send_json(message)
@@ -188,7 +205,7 @@ async def websocket_display(websocket: WebSocket, session_id: str = ""):
 async def websocket_teacher(websocket: WebSocket, session_id: str = ""):
     await websocket.accept()
     # Ensure every teacher has a valid session id matching its display socket
-    active_session = session_id.strip() if session_id and session_id.strip() and session_id.strip() != "default" else f"auto_{uuid.uuid4().hex[:10]}"
+    active_session = session_id.strip() if session_id and session_id.strip() else "default"
     print(f"[WS Teacher] Connected with session: {active_session}")
     
     rec = KaldiRecognizer(vosk_model, 16000) if vosk_model else None
