@@ -51,6 +51,11 @@ app.add_middleware(
 
 app.include_router(ai_tools_router)
 
+@app.get("/api/ping")
+@app.head("/api/ping")
+async def ping_endpoint():
+    return {"status": "ok", "service": "signova-backend"}
+
 # Initialize Vosk Model
 MODEL_PATH = "model" # vosk-model-small-en-in
 if os.path.exists(MODEL_PATH):
