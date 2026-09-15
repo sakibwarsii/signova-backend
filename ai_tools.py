@@ -25,12 +25,14 @@ if os.path.exists(FINGERSPELL_PATH):
         fingerspell_dict = json.load(f)
 
 def get_sigml_for_word_ai(word: str) -> list[str]:
-    if word in sign_dict:
-        return [sign_dict[word]]
+    w = word.lower().strip()
+    if w in sign_dict:
+        return [sign_dict[w]]
     sigml_list = []
-    for char in word:
-        if char in fingerspell_dict:
-            sigml_list.append(fingerspell_dict[char])
+    for char in w:
+        c = char.lower()
+        if c in fingerspell_dict:
+            sigml_list.append(fingerspell_dict[c])
     return sigml_list
 
 class BatchTextRequest(BaseModel):
@@ -422,10 +424,11 @@ Respond ONLY with a valid JSON:
 {{"concept": "...", "spoken_explanation": "..."}}"""
 
         resp = await groq_chat_completion(
-            model="qwen/qwen3.8-27b",
+            model="openai/gpt-oss-120b",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
-            max_tokens=150
+            max_tokens=150,
+            reasoning_effort="low"
         )
         content = resp.choices[0].message.content.strip()
         start = content.find('{')
